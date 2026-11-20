@@ -131,6 +131,14 @@ export class FeishuApp {
 
     this.disposers.push(
       this.ctx.on("session/event", (session, event) => this.runs.onSessionEvent(session, event)),
+      this.ctx.on("session/event", (session, event) => {
+        void this.handleSessionTitle(session, event).catch((error) => {
+          this.log.warn("处理会话标题事件失败", {
+            sessionId: session?.id,
+            error: describeError(error),
+          });
+        });
+      }),
       this.ctx.on("agent/assistant-stream", (payload) => this.runs.onStream(payload)),
       this.ctx.on("agent/status", (payload) => this.runs.onStatus(payload)),
       this.ctx.on("agent/error", (payload) => this.runs.onAgentError(payload)),
@@ -215,6 +223,42 @@ export class FeishuApp {
 
   isAllowed(openId) {
     return this.state.isAllowed(openId, this.config.allowUsers);
+  }
+
+  /**
+   * Keep Feishu topic names in step with the session title. Titles arrive
+   * asynchronously (deterministic fallback first, then the LLM provider), so the
+   * topic's root card is the only surface the new name can land on.
+   */
+  async handleSessionTitle(session, event) {
+    if (str(event?.type) !== "session/title") return;
+    const sessionId = str(session?.id);
+    const title = str(event?.data?.title).trim();
+    if (!sessionId || !title) return;
+    const links = this.state
+      .threadsForSession(sessionId)
+      .filter(({ link }) => link.cardMessageId && link.title !== title);
+    if (!links.length) return;
+    const view = await this.bridge.viewOf(sessionId).catch(() => undefined);
+    let changed = false;
+    for (const { link } of links) {
+      const card = openedSessionCard({
+        view: { ...(view ?? { sessionId }), title },
+        style: link.style || "created",
+      });
+      const patched = await this.sender.patchCard(link.cardMessageId, card);
+      if (!patched.ok) {
+        this.log.warn("话题标题更新失败", {
+          sessionId,
+          cardMessageId: link.cardMessageId,
+          error: patched.error,
+        });
+        continue;
+      }
+      link.title = title;
+      changed = true;
+    }
+    if (changed) void this.state.save();
   }
 
   // ---- routing -----------------------------------------------------------
@@ -856,8 +900,9 @@ export class FeishuApp {
       chatId,
       openId,
       anchorMessageId: sent.messageId,
-      title: view.title,
+      cardMessageId: sent.messageId,
       style,
+      title: view.title,
     });
     return { sent, threadId, view, brief };
   }
@@ -904,12 +949,6 @@ export class FeishuApp {
     return model?.provider && model?.model ? { provider: model.provider, model: model.model } : undefined;
   }
 
-  defaultSessionTitle() {
-    const now = new Date();
-    const pad = (n) => (n < 10 ? `0${n}` : String(n));
-    return `新会话 ${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  }
-
   async createFromForm(action) {
     const form = isRecord(action.formValue) ? action.formValue : {};
     const values = {
@@ -928,10 +967,11 @@ export class FeishuApp {
     const cwd = selectedDir || this.config.defaultDirectory;
 
     try {
-      const title = values.title || this.defaultSessionTitle();
+      // An empty title stays empty: the host's session-title service derives one
+      // from the first message. Renaming here would pin a user title and stop it.
       const sessionId = await this.bridge.createSession({
         cwd,
-        title,
+        title: values.title,
         model: model ?? this.defaultModelSelection(),
         preset: values.perm || this.config.defaultPermissionPreset,
       });

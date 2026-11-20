@@ -30,6 +30,9 @@ function normalize(raw) {
         chatId: str(value.chatId),
         openId: str(value.openId),
         anchorMessageId: str(value.anchorMessageId),
+        // Root card of the topic, patched when the session title arrives.
+        cardMessageId: str(value.cardMessageId),
+        style: str(value.style),
         title: str(value.title),
         createdAt: Number(value.createdAt) || Date.now(),
       };
@@ -110,7 +113,17 @@ export class StateStore {
 
   // ---- thread bindings ---------------------------------------------------
 
-  bindThread({ threadId, rootId, sessionId, chatId, openId, anchorMessageId, title }) {
+  bindThread({
+    threadId,
+    rootId,
+    sessionId,
+    chatId,
+    openId,
+    anchorMessageId,
+    cardMessageId,
+    style,
+    title,
+  }) {
     const sid = str(sessionId);
     if (!sid) return;
     const link = {
@@ -118,6 +131,8 @@ export class StateStore {
       chatId: str(chatId),
       openId: str(openId),
       anchorMessageId: str(anchorMessageId),
+      cardMessageId: str(cardMessageId),
+      style: str(style),
       title: str(title),
       createdAt: Date.now(),
     };
@@ -130,6 +145,26 @@ export class StateStore {
       this.state.roots[rootId] = alias ?? sid;
     }
     void this.save();
+  }
+
+  /** Every topic bound to one session, newest first, for title propagation. */
+  threadsForSession(sessionId) {
+    const sid = str(sessionId);
+    if (!sid) return [];
+    const links = [];
+    const seenCards = new Set();
+    for (const alias of [...(this.state.sessionThreads[sid] ?? [])].reverse()) {
+      const link = this.state.threads[alias];
+      if (!link) continue;
+      // Bindings made before root cards were recorded have nothing to patch but
+      // still belong to the session; only card-backed links deduplicate.
+      if (link.cardMessageId) {
+        if (seenCards.has(link.cardMessageId)) continue;
+        seenCards.add(link.cardMessageId);
+      }
+      links.push({ alias, link });
+    }
+    return links;
   }
 
   addSessionThread(sessionId, threadId) {
