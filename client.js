@@ -1,9 +1,11 @@
 /**
  * Client half of dsh-feishu-plugin.
  *
- * It contributes the plugin's configuration page to the Web UI's Plugins page.
- * The page edits the Host Config fields: App ID / Secret, the new-session
- * defaults (directory, model, permission) and the debug-log switch. Writes go
+ * It contributes the plugin's configuration page to the Web UI's Plugins page
+ * and a matching section to the Web Settings panel. Both surfaces render the
+ * same form against the same config row, so edits stay in sync. The form edits
+ * the Host Config fields: App ID / Secret, the new-session defaults (directory,
+ * model, permission), the answer shape and the debug-log switch. Writes go
  * through the plugin manager's ConfigPageForm, which persists them through the
  * profile's config editor and applies them live; credential changes restart the
  * Feishu long connection.
@@ -114,10 +116,12 @@ window.__ModuleLoader__.load({
       const form = props?.form;
       const state = form?.state;
       const value = state?.value ?? {};
+      const normalizeAnswerMode = (mode) => (mode === "card" ? "card" : "post");
 
       const [appId, setAppId] = useState("");
       const [appSecret, setAppSecret] = useState("");
       const [debugLog, setDebugLog] = useState(false);
+      const [answerMode, setAnswerMode] = useState(() => normalizeAnswerMode(value.answerMode));
       const [defaultDir, setDefaultDir] = useState("");
       const [defaultModelSel, setDefaultModelSel] = useState("");
       const [defaultPerm, setDefaultPerm] = useState("");
@@ -141,7 +145,9 @@ window.__ModuleLoader__.load({
           : "";
       const currentPerm =
         typeof value.defaultPermissionPreset === "string" ? value.defaultPermissionPreset : "";
+      const currentAnswerMode = normalizeAnswerMode(value.answerMode);
 
+      useEffect(() => setAnswerMode(currentAnswerMode), [currentAnswerMode]);
       useEffect(() => setDefaultDir(currentDir), [currentDir]);
       useEffect(() => setDefaultModelSel(currentModel), [currentModel]);
       useEffect(() => setDefaultPerm(currentPerm), [currentPerm]);
@@ -179,6 +185,7 @@ window.__ModuleLoader__.load({
         appId !== (typeof value.appId === "string" ? value.appId : "") ||
         appSecret.trim() !== "" ||
         debugLog !== (value.debugLog === true) ||
+        answerMode !== currentAnswerMode ||
         defaultDir.trim() !== currentDir ||
         defaultModelSel !== currentModel ||
         defaultPerm !== currentPerm;
@@ -214,6 +221,9 @@ window.__ModuleLoader__.load({
           if (defaultPerm !== currentPerm) {
             if (defaultPerm) ops.push({ op: "set", path: ["defaultPermissionPreset"], value: defaultPerm });
             else ops.push({ op: "unset", path: ["defaultPermissionPreset"] });
+          }
+          if (answerMode !== currentAnswerMode) {
+            ops.push({ op: "set", path: ["answerMode"], value: answerMode });
           }
           if (ops.length === 0) {
             setNotice("没有需要保存的变更。");
@@ -370,6 +380,32 @@ window.__ModuleLoader__.load({
           catalogError ? h("span", { style: styles.error }, `模型/权限目录读取失败：${catalogError}`) : null,
         ),
         h(
+          "div",
+          { style: styles.section },
+          h("div", { style: styles.sectionTitle }, "回答形态"),
+          h(
+            "div",
+            { style: styles.row },
+            h(
+              "select",
+              {
+                style: styles.select,
+                value: answerMode,
+                "aria-label": "回答形态",
+                disabled: !writable || busy,
+                onChange: (event) => setAnswerMode(normalizeAnswerMode(event.target.value)),
+              },
+              h("option", { value: "post" }, "富文本消息（post）"),
+              h("option", { value: "card" }, "卡片（card）"),
+            ),
+            h(
+              "span",
+              { style: styles.hint },
+              "post：普通富文本消息；card：可实时刷新的卡片（流式文字、思考与工具面板）。保存后新回答立即按所选形态发送。",
+            ),
+          ),
+        ),
+        h(
           "label",
           { style: styles.toggleRow },
           h("input", {
@@ -413,13 +449,34 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The bundle page passes no form prop; bind the entry's shared
-     * ConfigForm directly so the credentials editor renders on the package
-     * page itself, where users look first.
+     * Track one shared config form's snapshot. The settings section and the
+     * plugin page subscribe to the same form, so a save in either surface
+     * re-renders both.
      */
-    function BundleConfig({ configForm, loadCatalogs, pickDirectory }) {
+    function useConfigSnapshot(configForm) {
       const [state, setState] = useState(() => configForm.getSnapshot());
       useEffect(() => configForm.subscribe(() => setState(configForm.getSnapshot())), [configForm]);
+      return state;
+    }
+
+    /**
+     * Shared page for both config surfaces: the plugin detail page and the Web
+     * Settings section. It binds the entry's shared ConfigForm, so an edit on
+     * either surface shows up on both. When the Host serves no config row
+     * (plugin not enabled), show why instead of an empty form.
+     */
+    function ConfigPage({ configForm, loadCatalogs, pickDirectory }) {
+      const state = useConfigSnapshot(configForm);
+      if (state.status === "loading") {
+        return h("div", { style: styles.hint }, "正在读取飞书桥接配置…");
+      }
+      if (state.status === "unavailable") {
+        return h(
+          "div",
+          { style: styles.hint },
+          "飞书桥接插件未启用，暂时无法配置。请先在「插件」页启用该插件。",
+        );
+      }
       const form = { state, mutate: configForm.mutate.bind(configForm) };
       return h(FeishuConfig, { view: "page", form, loadCatalogs, pickDirectory });
     }
@@ -466,15 +523,16 @@ window.__ModuleLoader__.load({
           const picked = await ctx.uiWorkspace.pickDirectory();
           return picked ?? undefined;
         };
-        ctx.slots.inject("plugins.bundle.config", () =>
+        const registerConfigPage = (options) =>
           ctx.slots.register(
             {
-              name: "plugins.bundle.config",
-              key: "dsh-feishu-plugin",
+              ...options,
               inject: () => ({ configForm, loadCatalogs, pickDirectory }),
             },
-            BundleConfig,
-          ),
+            ConfigPage,
+          );
+        ctx.slots.inject("plugins.bundle.config", () =>
+          registerConfigPage({ name: "plugins.bundle.config", key: "dsh-feishu-plugin" }),
         );
         ctx.slots.inject("plugins.row.config", () =>
           ctx.slots.register(
@@ -485,6 +543,14 @@ window.__ModuleLoader__.load({
             },
             FeishuConfig,
           ),
+        );
+        ctx.slots.inject("settings.section", () =>
+          registerConfigPage({
+            name: "settings.section",
+            id: "feishu-bridge",
+            order: 30,
+            label: () => "飞书桥接",
+          }),
         );
       },
     };
