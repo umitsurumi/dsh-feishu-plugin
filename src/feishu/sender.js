@@ -18,6 +18,17 @@ function ok(res) {
   return !res?.code || res.code === 0;
 }
 
+/**
+ * Thread id of a message the bridge just sent. Recent reply responses carry it
+ * directly; older ones only expose it when the message is read back.
+ */
+export async function threadIdOf(sender, sent) {
+  if (!sent?.ok) return undefined;
+  if (sent.threadId) return sent.threadId;
+  const meta = await sender.getMessageMeta(sent.messageId);
+  return meta?.threadId;
+}
+
 export function createSender(client, log) {
   return {
     async sendCard(chatId, card) {

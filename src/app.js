@@ -31,8 +31,9 @@ import { RunCards } from "./dsh/runs.js";
 import { FeishuApprovals } from "./dsh/approvals.js";
 import { FeishuQuestions } from "./dsh/questions.js";
 import { createFeishuClient, startGateway } from "./feishu/gateway.js";
-import { createSender } from "./feishu/sender.js";
-import { Dedup, createSigner, newRequestId } from "./security.js";
+import { isBotMention } from "./feishu/events.js";
+import { createSender, threadIdOf } from "./feishu/sender.js";
+import { Dedup, SIGNER_TTL_MS, createSigner, newRequestId } from "./security.js";
 import { StateStore } from "./state.js";
 import {
   describeError,
@@ -47,6 +48,11 @@ import {
 } from "./utils.js";
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+// Every plain main-chat message can mint a token, so the map is pruned and
+// capped instead of keeping prompt bodies around. Expiry comes from the signer
+// so the pending entry and the token cannot drift apart.
+const QUICKNEW_LIMIT = 200;
 
 function detectImageType(bytes, contentType) {
   const header = str(contentType).split(";")[0].trim().toLowerCase();
@@ -75,6 +81,19 @@ function sanitizeName(name, fallback = "attachment") {
   return cleaned || fallback;
 }
 
+function hasPrompt(message) {
+  return Boolean(str(message.text).trim()) || (message.attachments?.length ?? 0) > 0;
+}
+
+// Empty sessions need a topic name before the host generates the real title.
+// It only names the topic card; the session title stays unset so the first
+// message can still generate one.
+function emptySessionTitle(now = Date.now()) {
+  const date = new Date(now);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `新会话 ${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export class FeishuApp {
   constructor({ ctx, config, rawConfig, log }) {
     this.ctx = ctx;
@@ -84,17 +103,24 @@ export class FeishuApp {
     this.reconfiguring = undefined;
     this.state = new StateStore({ file: config.stateFile, log });
     this.signer = createSigner(config.signSecret);
+    // Stamped into every quicknew token so a token from before a restart reads
+    // as expired even though the same signSecret still verifies it.
+    this.tokenEpoch = newRequestId("quicknew");
     this.dedup = new Dedup();
     this.threadCreates = new Map();
+    // Signed quicknew tokens → the main-chat message they stand for.
+    this.pending = new Map();
     this.disposers = [];
     this.gateway = undefined;
+    // The bot's own open_id, resolved once the long connection starts.
+    this.botOpenId = "";
     this.startedAt = Date.now();
   }
 
   async init() {
     await this.state.load();
-    const client = createFeishuClient(this.config);
-    this.sender = createSender(client, this.log);
+    this.client = createFeishuClient(this.config);
+    this.sender = createSender(this.client, this.log);
     this.bridge = new DshBridge(this.ctx, this.config, this.log);
     this.runs = new RunCards({
       bridge: this.bridge,
@@ -143,6 +169,7 @@ export class FeishuApp {
       this.ctx.on("agent/status", (payload) => this.runs.onStatus(payload)),
       this.ctx.on("agent/error", (payload) => this.runs.onAgentError(payload)),
     );
+    void this.refreshBotOpenId();
   }
 
   start() {
@@ -171,6 +198,7 @@ export class FeishuApp {
     }
     this.disposers = [];
     this.threadCreates.clear();
+    this.pending.clear();
   }
 
   /**
@@ -186,6 +214,8 @@ export class FeishuApp {
       if (!next.enabled) {
         this.gateway?.stop();
         this.gateway = undefined;
+        this.client = undefined;
+        this.botOpenId = "";
         this.config = next;
         this.log.warn("飞书凭据已清空，长连接已停止");
         return;
@@ -208,12 +238,13 @@ export class FeishuApp {
         return;
       }
       this.gateway?.stop();
-      const client = createFeishuClient(next);
-      this.sender = createSender(client, this.log);
+      this.client = createFeishuClient(next);
+      this.sender = createSender(this.client, this.log);
       this.runs.sender = this.sender;
       this.approvals.sender = this.sender;
       this.questions.sender = this.sender;
       this.start();
+      void this.refreshBotOpenId();
       this.log.info("飞书凭据已更新，长连接已重启", { appId: maskId(next.appId), domain: next.domain });
     })().finally(() => {
       this.reconfiguring = undefined;
@@ -237,11 +268,10 @@ export class FeishuApp {
     if (!sessionId || !title) return;
     const links = this.state
       .threadsForSession(sessionId)
-      .filter(({ link }) => link.cardMessageId && link.title !== title);
+      .filter((link) => link.cardMessageId && link.title !== title);
     if (!links.length) return;
     const view = await this.bridge.viewOf(sessionId).catch(() => undefined);
-    let changed = false;
-    for (const { link } of links) {
+    for (const link of links) {
       const card = openedSessionCard({
         view: { ...(view ?? { sessionId }), title },
         style: link.style || "created",
@@ -255,15 +285,124 @@ export class FeishuApp {
         });
         continue;
       }
-      link.title = title;
-      changed = true;
+      this.state.setThreadTitle(link.cardMessageId, title);
     }
-    if (changed) void this.state.save();
+  }
+
+  /** Resolve the bot's own open_id so "@ this bot" can be told apart from "@ someone". */
+  async refreshBotOpenId() {
+    // An id from the previous app credentials must never keep the quick path open.
+    this.botOpenId = "";
+    if (!this.client) return;
+    try {
+      const res = await this.client.request({ method: "GET", url: "/open-apis/bot/v3/info" });
+      const openId = str(res?.bot?.open_id);
+      if (!openId) {
+        this.log.warn("机器人信息缺少 open_id，快捷会话不可用", { code: res?.code, msg: res?.msg });
+        return;
+      }
+      this.botOpenId = openId;
+      this.log.info("已获取机器人身份", { botOpenId: maskId(openId) });
+    } catch (error) {
+      this.log.warn("获取机器人身份失败，快捷会话不可用", { error: describeError(error) });
+    }
+  }
+
+  /**
+   * Quick session: create the session with the configured defaults, send the
+   * opened-session card as the topic root, then deliver the request itself
+   * (text and attachments) through the normal prompt path. With a prompt the
+   * run card opens the topic; a bare @ gets a short placeholder instead.
+   *
+   * `anchorMessageId` is the request message: the @ message, or the management
+   * card that stashed the message. It is only the error-reporting anchor now;
+   * the user's message stays in the main chat. The message keeps its own id for
+   * attachment downloads and the request id.
+   */
+  async quickStart(message, anchorMessageId) {
+    this.log.info("快捷建会话", { messageId: message.messageId, chatId: message.chatId });
+    const withPrompt = hasPrompt(message);
+    let sessionId;
+    let opened;
+    try {
+      sessionId = await this.bridge.createSession({
+        cwd: this.config.defaultDirectory,
+        preset: this.config.defaultPermissionPreset,
+        model: this.defaultModelSelection(),
+      });
+      opened = await this.openSessionThread(
+        sessionId,
+        message.chatId,
+        message.senderOpenId,
+        "created",
+        // With a prompt the run card opens the topic; a bare @ needs the
+        // placeholder message to open it now.
+        { defer: withPrompt },
+      );
+    } catch (error) {
+      this.log.warn("快捷建会话失败", { sessionId, error: describeError(error) });
+      await this.sender.replyCard(anchorMessageId, errorCard("无法创建会话", describeError(error)));
+      return undefined;
+    }
+    // A bare @ asks for the session only; its root card is the feedback, so
+    // deliver nothing rather than an empty or placeholder prompt.
+    if (!withPrompt) return sessionId;
+    try {
+      await this.promptSession(sessionId, message, {
+        anchorMessageId: opened.sent.messageId,
+        chatId: message.chatId,
+        // The run card is what opens this topic, so there is no thread id yet;
+        // `openTopic` carries it back through `bindOpenedSession`.
+        openTopic: { opened, openId: message.senderOpenId, style: "created" },
+      });
+    } catch (error) {
+      // The run card is what opens the topic here, so a throw means no topic was
+      // opened: report it on the root card instead of binding a session that has
+      // no thread to answer in.
+      await this.reportTopicNotOpened(sessionId, opened.sent.messageId, error);
+    }
+    return sessionId;
+  }
+
+  /**
+   * Keep the whole main-chat message in memory and mint a one-shot token for
+   * the management card. The body stays out of the button value: a long prompt
+   * would blow up the card, and attachment keys only work while this process
+   * holds them.
+   */
+  stashQuickNew(message) {
+    const exp = Date.now() + SIGNER_TTL_MS;
+    const pendingKey = this.signer.sign({ q: "quicknew", m: message.messageId, e: this.tokenEpoch, exp });
+    this.pending.set(pendingKey, { message, exp });
+    const now = Date.now();
+    for (const [key, entry] of this.pending) {
+      if (entry.exp <= now) this.pending.delete(key);
+    }
+    while (this.pending.size > QUICKNEW_LIMIT) {
+      this.pending.delete(this.pending.keys().next().value);
+    }
+    return pendingKey;
+  }
+
+  /**
+   * Build the management card for a plain main-chat message. When the message
+   * carries a prompt this stashes it behind a one-shot quicknew token and puts
+   * that token on the card's button.
+   */
+  offerQuickNew(message) {
+    if (!hasPrompt(message)) return mainHintCard({});
+    const text = str(message.text).trim();
+    return mainHintCard({
+      pendingKey: this.stashQuickNew(message),
+      pendingText: text || `📎 ${message.attachments.length} 个附件`,
+    });
   }
 
   // ---- routing -----------------------------------------------------------
 
   async handleMessage(message) {
+    // Group messages are not bridged at all: falling through would answer chat
+    // traffic with the management card.
     if (message.chatType !== "p2p") return;
     if (!this.dedup.take(message.messageId) || (message.eventId && !this.dedup.take(message.eventId))) {
       this.log.debug("忽略重复飞书消息", { messageId: message.messageId });
@@ -343,12 +482,23 @@ export class FeishuApp {
         );
         return;
       }
-      await this.promptSession(sessionId, message, message.messageId, message.chatId, threadId);
+      await this.promptSession(sessionId, message, {
+        anchorMessageId: message.messageId,
+        chatId: message.chatId,
+        threadId,
+      });
       return;
     }
 
     if (threadId) {
       await this.createSessionInThread(message, threadId, rootId);
+      return;
+    }
+
+    // An @ in the private main chat is a one-step request for a new session:
+    // it must not fall through to the management card or consoleIntent.
+    if (isBotMention(message, this.botOpenId)) {
+      await this.quickStart(message, message.messageId);
       return;
     }
 
@@ -358,13 +508,13 @@ export class FeishuApp {
   async handleMainText(message) {
     const text = str(message.text).trim();
     if (!this.config.consoleIntent || !text) {
-      await this.sender.sendCard(message.chatId, mainHintCard({}));
+      await this.sender.sendCard(message.chatId, this.offerQuickNew(message));
       return;
     }
 
     const ack = await this.sender.sendCard(message.chatId, thinkingCard());
     if (!ack.ok || !ack.messageId) {
-      await this.sender.sendCard(message.chatId, mainHintCard({}));
+      await this.sender.sendCard(message.chatId, this.offerQuickNew(message));
       return;
     }
 
@@ -399,7 +549,7 @@ export class FeishuApp {
       });
 
       if (!resolved) {
-        await this.finishThinking(ack.messageId, message.chatId, mainHintCard({}));
+        await this.finishThinking(ack.messageId, message.chatId, this.offerQuickNew(message));
         return;
       }
 
@@ -446,9 +596,8 @@ export class FeishuApp {
       }
 
       if (resolved.intent === "enter") {
-          const opened = await this.openSessionThread(
+        const opened = await this.openSessionThread(
           resolved.sessionId,
-          ack.messageId,
           message.chatId,
           message.senderOpenId,
           "resumed",
@@ -461,7 +610,7 @@ export class FeishuApp {
         return;
       }
 
-      await this.finishThinking(ack.messageId, message.chatId, mainHintCard({}));
+      await this.finishThinking(ack.messageId, message.chatId, this.offerQuickNew(message));
     } catch (error) {
       this.log.warn("主聊天意图识别失败，尝试确定性回退", {
         error: describeError(error),
@@ -499,7 +648,6 @@ export class FeishuApp {
         } else if (fallback.intent === "enter") {
           const opened = await this.openSessionThread(
             fallback.sessionId,
-            ack.messageId,
             message.chatId,
             message.senderOpenId,
             "resumed",
@@ -526,11 +674,11 @@ export class FeishuApp {
             }),
           );
         } else {
-          await this.finishThinking(ack.messageId, message.chatId, mainHintCard({}));
+          await this.finishThinking(ack.messageId, message.chatId, this.offerQuickNew(message));
         }
       } catch (fallbackError) {
         this.log.warn("意图识别确定性回退失败", { error: describeError(fallbackError) });
-        await this.finishThinking(ack.messageId, message.chatId, mainHintCard({}));
+        await this.finishThinking(ack.messageId, message.chatId, this.offerQuickNew(message));
       }
     }
   }
@@ -578,7 +726,11 @@ export class FeishuApp {
         const sessionId = await pending;
         if (sessionId) {
           this.state.touchThread(threadId, message.messageId);
-          await this.promptSession(sessionId, message, message.messageId, message.chatId, threadId);
+          await this.promptSession(sessionId, message, {
+            anchorMessageId: message.messageId,
+            chatId: message.chatId,
+            threadId,
+          });
         }
       } catch (error) {
         this.log.warn("等待话题建会话失败", { threadId, error: describeError(error) });
@@ -601,6 +753,8 @@ export class FeishuApp {
         chatId: message.chatId,
         openId: message.senderOpenId,
         anchorMessageId: message.messageId,
+        cardMessageId: sent.messageId,
+        style: "created",
         title: view.title,
       });
       return sessionId;
@@ -608,7 +762,11 @@ export class FeishuApp {
     this.threadCreates.set(threadId, creation);
     try {
       const sessionId = await creation;
-      await this.promptSession(sessionId, message, message.messageId, message.chatId, threadId);
+      await this.promptSession(sessionId, message, {
+        anchorMessageId: message.messageId,
+        chatId: message.chatId,
+        threadId,
+      });
     } catch (error) {
       this.log.warn("话题内自动建会话失败", { error: describeError(error) });
       await this.sender.replyCard(message.messageId, errorCard("无法创建会话", describeError(error)));
@@ -792,13 +950,12 @@ export class FeishuApp {
         await this.replyFor(message, errorCard("缺少内容", `用法：\`/${name} 文本\``));
         return;
       }
-      await this.promptSession(
-        sessionId,
-        { ...message, text: command.args, attachments: [] },
-        message.messageId,
-        message.chatId,
-        name,
-      );
+      await this.promptSession(sessionId, { ...message, text: command.args, attachments: [] }, {
+        anchorMessageId: message.messageId,
+        chatId: message.chatId,
+        threadId,
+        overrideMode: name,
+      });
       return;
     }
     await this.replyFor(message, helpCard());
@@ -873,8 +1030,21 @@ export class FeishuApp {
     }
   }
 
-  async openSessionThread(sessionId, anchorMessageId, chatId, openId, style) {
+  /**
+   * Open a fresh Feishu topic for a session. The topic root must be the
+   * bridge's own session card, because Feishu takes the topic name from the
+   * root card's header and lets the bridge patch it when the title arrives.
+   *
+   * A blank session has no title to name the topic with yet, so its root card
+   * carries the timestamp until the first message generates one.
+   *
+   * `defer: true` leaves the topic unopened: the first prompt's run card opens
+   * it and becomes the first topic message. The prompt path then binds the
+   * returned thread id through `bindOpenedSession`.
+   */
+  async openSessionThread(sessionId, chatId, openId, style, { defer = false } = {}) {
     const view = await this.bridge.viewOf(sessionId);
+    const shown = view.blank ? { ...view, title: emptySessionTitle() } : view;
     const brief =
       style === "created"
         ? undefined
@@ -885,26 +1055,54 @@ export class FeishuApp {
               timer.unref?.();
             }),
           ]);
-    // Match OpenCode's resume flow: every entry creates a fresh Feishu topic
-    // (card) and simply binds it to the existing DSH session. The previous
-    // topic stays intact; replies still follow the topic the user writes in.
-    const sent = await this.sender.replyCard(anchorMessageId, openedSessionCard({ view, style, brief }), { replyInThread: true });
+    // Every entry creates a fresh topic and simply binds it to the session. The
+    // previous topic stays intact; replies still follow the topic the user
+    // writes in.
+    const sent = await this.sender.sendCard(chatId, openedSessionCard({ view: shown, style, brief }));
     if (!sent.ok) throw new Error(sent.error ?? "无法创建话题");
-    const meta = sent.threadId ? undefined : await this.sender.getMessageMeta(sent.messageId);
-    const threadId = sent.threadId ?? meta?.threadId;
-    const rootId = sent.rootId ?? meta?.rootId ?? sent.messageId;
+    let threadId;
+    if (!defer) {
+      const marked = await this.sender.replyText(sent.messageId, "在话题里直接说话即可", {
+        replyInThread: true,
+      });
+      if (!marked.ok) throw new Error(marked.error ?? "无法创建话题");
+      threadId = await threadIdOf(this.sender, marked);
+      this.bindOpenedSession(
+        sessionId,
+        { sent, view: shown },
+        { chatId, openId, style, threadId, anchorMessageId: marked.messageId },
+      );
+    }
+    return { sent, threadId, view: shown, brief };
+  }
+
+  bindOpenedSession(sessionId, opened, { chatId, openId, style, threadId, anchorMessageId }) {
+    const rootId = opened.sent.messageId;
     this.state.bindThread({
       threadId,
       rootId,
       sessionId,
       chatId,
       openId,
-      anchorMessageId: sent.messageId,
-      cardMessageId: sent.messageId,
+      anchorMessageId: anchorMessageId || rootId,
+      cardMessageId: rootId,
       style,
-      title: view.title,
+      title: opened.view.title,
     });
-    return { sent, threadId, view, brief };
+  }
+
+  /**
+   * A topic that only opens through its first message has no thread when that
+   * message cannot be sent. There is nowhere to bind or answer, so report it on
+   * the session's root card instead of leaving a binding that points at no topic.
+   */
+  async reportTopicNotOpened(sessionId, rootCardMessageId, error) {
+    const detail = describeError(error);
+    this.log.warn("话题未能打开", { sessionId, cardMessageId: rootCardMessageId, error: detail });
+    await this.sender.replyCard(
+      rootCardMessageId,
+      errorCard("无法打开话题", `${detail}\n\n会话已创建，请从会话列表重新进入这个会话再发送。`),
+    );
   }
 
   async openByIndex(message, args) {
@@ -925,7 +1123,6 @@ export class FeishuApp {
       }
       await this.openSessionThread(
         views[index].sessionId,
-        message.messageId,
         message.chatId,
         message.senderOpenId,
         "resumed",
@@ -977,15 +1174,14 @@ export class FeishuApp {
       });
       const opened = await this.openSessionThread(
         sessionId,
-        action.messageId,
         action.chatId,
         action.operatorOpenId,
         "created",
       );
       // Like the OpenCode plugin: the submitted form card itself turns into
       // the session card; the separate card in the new topic is its root.
-      // The form message becomes the new topic's anchor, so update it after the
-      // callback settles rather than returning a card in the same response.
+      // Update it after the callback settles rather than returning a card in
+      // the same response.
       this.patchCardSoon(action, openedSessionCard({ view: opened.view, style: "created" }));
       return { toast: { type: "success", content: "会话已创建" } };
     } catch (error) {
@@ -1014,9 +1210,34 @@ export class FeishuApp {
     }
   }
 
+  async quickNewFromAction(action) {
+    const value = isRecord(action.value) ? action.value : {};
+    const token = str(value.k);
+    const payload = this.signer.verify(token);
+    // The pending map lives in this process only, so a token signed before a
+    // restart still verifies but refers to a message that no longer exists.
+    if (!payload || payload.e !== this.tokenEpoch) {
+      return { toast: { type: "error", content: "这条消息已过期，请重新发送" } };
+    }
+    const pending = this.pending.get(token);
+    // A consumed entry stays in the map so a repeat click can be told apart
+    // from one whose message was pruned or lost to a restart.
+    if (!pending) return { toast: { type: "error", content: "这条消息已过期，请重新发送" } };
+    if (pending.used) return { toast: { type: "error", content: "这条消息已经用过了" } };
+    // Consume before creating so a double click cannot start two sessions.
+    pending.used = true;
+    const sessionId = await this.quickStart(pending.message, action.messageId);
+    if (!sessionId) return { toast: { type: "error", content: "无法创建会话" } };
+    return { toast: { type: "success", content: "会话已创建" } };
+  }
+
   // ---- prompt delivery ---------------------------------------------------
 
-  async promptSession(sessionId, message, anchorMessageId, chatId, threadId, overrideMode) {
+  async promptSession(
+    sessionId,
+    message,
+    { anchorMessageId, chatId, threadId, overrideMode, openTopic },
+  ) {
     const view = await this.bridge.viewOf(sessionId).catch(() => undefined);
     const active = this.runs.active(sessionId);
     if (active && threadId && active.threadId && active.threadId !== threadId) {
@@ -1033,7 +1254,33 @@ export class FeishuApp {
       );
       return;
     }
-    const run = await this.runs.beginPrompt(sessionId, { anchorMessageId, chatId, threadId });
+    const run = await this.runs.beginPrompt(sessionId, {
+      anchorMessageId,
+      chatId,
+      threadId,
+      openThread: Boolean(openTopic),
+    });
+    if (openTopic) {
+      if (!run.threadId) {
+        // The topic only exists through this run card. Without a thread id there
+        // is nowhere to deliver the answer, so do not bind and do not submit:
+        // a binding without a topic would route the answer into the main chat.
+        const detail = run.error || "无法确定话题";
+        this.runs.finish(run, "error", detail);
+        await this.reportTopicNotOpened(sessionId, openTopic.opened.sent.messageId, detail);
+        return;
+      }
+      // Bind as soon as the first thread message exists: the user can write in the
+      // topic while attachments are still downloading, and routed replies must not
+      // start a second session there.
+      this.bindOpenedSession(sessionId, openTopic.opened, {
+        chatId,
+        openId: openTopic.openId,
+        style: openTopic.style,
+        threadId: run.threadId,
+        anchorMessageId: run.messageId || run.ackMessageId,
+      });
+    }
     try {
       const content = await this.buildPromptContent(sessionId, message);
       const mode = overrideMode ?? (view?.running || this.bridge.isRunning(sessionId) ? this.config.busyDelivery : "queue");
@@ -1263,7 +1510,6 @@ export class FeishuApp {
       try {
         const opened = await this.openSessionThread(
           sessionId,
-          action.messageId,
           action.chatId,
           action.operatorOpenId,
           "resumed",
@@ -1291,6 +1537,7 @@ export class FeishuApp {
     }
 
     if (kind === "create") return this.createFromForm(action);
+    if (kind === "quicknew") return this.quickNewFromAction(action);
 
     if (kind === "modelpage") {
       const sid = str(value.s);

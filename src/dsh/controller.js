@@ -106,7 +106,9 @@ export class DshBridge {
       cwd: cwd || undefined,
       updatedAt: Number(summary.updatedAt) || 0,
       running: this.running.has(sessionId) || Boolean(summary.running),
-      blank: Boolean(summary.blank),
+      // A hand-written title is already a real topic name, so a titled session
+      // is not blank for topic naming even though no turn has started yet.
+      blank: Boolean(summary.blank) && !title,
       agentAvailable: Boolean(summary.agentAvailable),
       perm,
       model: model && model.provider && model.model

@@ -1,6 +1,7 @@
 /** Turns DSH session events into one live Feishu card per turn. */
 import { describeError, errorMessage, formatDuration, truncate, toolPreview } from "../utils.js";
 import { answerPartCard, runCard, splitAnswerForCards } from "../cards.js";
+import { threadIdOf } from "../feishu/sender.js";
 import { mdToPosts } from "../post-render.js";
 
 function textOfMessage(message) {
@@ -18,10 +19,6 @@ export class RunCards {
     this.state = state;
     this.config = config;
     this.log = log;
-    // Post mode answers as ordinary rich-text messages instead of a live card.
-    // A card can be patched while the model streams; a post cannot, so post
-    // mode trades streaming for a chat-like transcript.
-    this.postMode = config.answerMode === "post";
     this.runs = new Map();
     this.heartbeat = setInterval(() => {
       for (const run of this.runs.values()) {
@@ -29,6 +26,16 @@ export class RunCards {
       }
     }, 5_000);
     this.heartbeat.unref?.();
+  }
+
+  /**
+   * Post mode answers as ordinary rich-text messages instead of a live card.
+   * A card can be patched while the model streams; a post cannot, so post mode
+   * trades streaming for a chat-like transcript. Read the current config so a
+   * settings-page save takes effect on the next turn.
+   */
+  get postMode() {
+    return this.config.answerMode === "post";
   }
 
   dispose() {
@@ -44,7 +51,7 @@ export class RunCards {
     return run && !run.finished ? run : undefined;
   }
 
-  async beginPrompt(sessionId, { anchorMessageId, chatId, threadId }) {
+  async beginPrompt(sessionId, { anchorMessageId, chatId, threadId, openThread = false }) {
     const current = this.active(sessionId);
     if (current) {
       current.promptCount += 1;
@@ -79,14 +86,17 @@ export class RunCards {
     };
     this.runs.set(sessionId, run);
     if (this.postMode) {
-      await this.sendAck(run, "\u{1F914} 处理中…");
+      await this.sendAck(run, "\u{1F914} 处理中…", openThread);
     } else {
       const card = runCard({ run, maxAnswerChars: this.config.maxAnswerChars });
       const sent = anchorMessageId
-        ? await this.sender.replyCard(anchorMessageId, card)
+        ? await this.sender.replyCard(anchorMessageId, card, { replyInThread: openThread })
         : await this.sender.sendCard(chatId, card);
       if (sent.ok) run.messageId = sent.messageId;
       else run.error = sent.error ?? "无法发送运行卡片";
+      // The run card is the first message of a brand-new topic; its thread id
+      // becomes the session's binding target.
+      if (openThread && run.anchorMessageId) run.threadId = await threadIdOf(this.sender, sent);
     }
     this.schedule(run, true);
     return run;
@@ -96,12 +106,15 @@ export class RunCards {
    * Post mode has no card to patch, so the only progress signal is a short
    * placeholder that `sendAnswer` recalls once the turn ends.
    */
-  async sendAck(run, text) {
+  async sendAck(run, text, openThread = false) {
     const sent = run.anchorMessageId
-      ? await this.sender.replyText(run.anchorMessageId, text, { replyInThread: Boolean(run.threadId) })
+      ? await this.sender.replyText(run.anchorMessageId, text, {
+          replyInThread: openThread || Boolean(run.threadId),
+        })
       : await this.sender.sendText(run.chatId, text);
     if (sent.ok) run.ackMessageId = sent.messageId;
     else run.error = sent.error ?? "无法发送处理中提示";
+    if (openThread && run.anchorMessageId) run.threadId = await threadIdOf(this.sender, sent);
     return sent;
   }
 
@@ -282,7 +295,9 @@ export class RunCards {
     if (ackId) await quiet(() => this.sender.recallMessage(ackId));
     const reply = async (post) =>
       run.anchorMessageId
-        ? await this.sender.replyPost(run.anchorMessageId, post)
+        ? await this.sender.replyPost(run.anchorMessageId, post, {
+            replyInThread: Boolean(run.threadId),
+          })
         : await this.sender.sendPost(run.chatId, post);
     const replyText = async (text) =>
       run.anchorMessageId

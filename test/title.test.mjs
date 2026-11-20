@@ -44,25 +44,28 @@ test("threadsForSession lists every bound topic newest first and keeps its root 
 
     const links = store.threadsForSession("session-1");
     assert.deepEqual(
-      links.map(({ link }) => [link.cardMessageId, link.style]),
+      links.map((link) => [link.cardMessageId, link.style]),
       [
         ["om_card_1", "entered"],
         ["om_card_2", "resumed"],
       ],
     );
     assert.deepEqual(
-      store.threadsForSession("session-2").map(({ link }) => link.cardMessageId),
+      store.threadsForSession("session-2").map((link) => link.cardMessageId),
       ["om_card_other"],
     );
+
+    store.setThreadTitle("om_card_1", "更新后的标题");
+    await store.saving;
 
     const reloaded = new StateStore({ file });
     await reloaded.load();
     const persisted = reloaded.threadsForSession("session-1");
     assert.deepEqual(
-      persisted.map(({ link }) => [link.cardMessageId, link.style]),
+      persisted.map((link) => [link.cardMessageId, link.style, link.title]),
       [
-        ["om_card_1", "entered"],
-        ["om_card_2", "resumed"],
+        ["om_card_1", "entered", "更新后的标题"],
+        ["om_card_2", "resumed", "旧标题"],
       ],
     );
   } finally {
@@ -108,8 +111,11 @@ function formHarness(file) {
     },
   };
   app.sender = {
-    async replyCard() {
-      return { ok: true, messageId: "om_topic_root", threadId: "omt_1", rootId: "om_root" };
+    async sendCard() {
+      return { ok: true, messageId: "om_topic_root" };
+    },
+    async replyText() {
+      return { ok: true, messageId: "om_placeholder", threadId: "omt_1" };
     },
     async patchCard() {
       return { ok: true };
@@ -187,7 +193,7 @@ test("a session title event patches the topic root card bound to that session", 
     assert.match(JSON.stringify(byCard.get("om_a")), /会话已创建/);
     assert.match(JSON.stringify(byCard.get("om_b")), /已在这个话题里接入/);
     assert.deepEqual(
-      app.state.threadsForSession("session-2").map(({ link }) => link.title),
+      app.state.threadsForSession("session-2").map((link) => link.title),
       ["别的会话"],
     );
 
@@ -195,7 +201,7 @@ test("a session title event patches the topic root card bound to that session", 
     const reloaded = new StateStore({ file });
     await reloaded.load();
     assert.deepEqual(
-      reloaded.threadsForSession("session-1").map(({ link }) => link.title),
+      reloaded.threadsForSession("session-1").map((link) => link.title),
       ["新标题", "新标题"],
     );
   } finally {
@@ -251,10 +257,10 @@ test("a state file without title-propagation fields still loads", async () => {
     );
     const store = new StateStore({ file });
     await store.load();
-    const [entry] = store.threadsForSession("session-old");
-    assert.equal(entry.alias, "omt_old");
-    assert.equal(entry.link.cardMessageId, "");
-    assert.equal(entry.link.style, "");
+    const [link] = store.threadsForSession("session-old");
+    assert.equal(link.sessionId, "session-old");
+    assert.equal(link.cardMessageId, "");
+    assert.equal(link.style, "");
     assert.equal(store.sessionForRoot("om_root"), "session-old");
   } finally {
     await cleanup();

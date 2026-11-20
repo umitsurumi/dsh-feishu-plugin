@@ -162,9 +162,23 @@ export class StateStore {
         if (seenCards.has(link.cardMessageId)) continue;
         seenCards.add(link.cardMessageId);
       }
-      links.push({ alias, link });
+      links.push(link);
     }
     return links;
+  }
+
+  /** Record the session title on every binding that points at one topic root card. */
+  setThreadTitle(cardMessageId, title) {
+    const card = str(cardMessageId);
+    const next = str(title);
+    if (!card || !next) return;
+    let changed = false;
+    for (const link of Object.values(this.state.threads)) {
+      if (link.cardMessageId !== card || link.title === next) continue;
+      link.title = next;
+      changed = true;
+    }
+    if (changed) void this.save();
   }
 
   addSessionThread(sessionId, threadId) {

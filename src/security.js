@@ -9,11 +9,14 @@ function fromB64url(input) {
   return Buffer.from(input, "base64url").toString("utf8");
 }
 
+/** Default lifetime of a signed card payload; the quicknew pending map expires with it. */
+export const SIGNER_TTL_MS = 600_000;
+
 export function createSigner(secret) {
   if (!secret) throw new Error("signer requires a secret");
 
   const sign = (payload) => {
-    const body = b64url(JSON.stringify({ ...payload, exp: payload.exp ?? Date.now() + 600_000 }));
+    const body = b64url(JSON.stringify({ ...payload, exp: payload.exp ?? Date.now() + SIGNER_TTL_MS }));
     const sig = createHmac("sha256", secret).update(body).digest("base64url");
     return `${body}.${sig}`;
   };

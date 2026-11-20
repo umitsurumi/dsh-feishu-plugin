@@ -123,6 +123,41 @@ test("DshBridge.prompt passes the AbortSignal required by prompt admission", asy
   assert.ok(captured.signal instanceof AbortSignal);
 });
 
+test("a session with a title is not blank for topic naming", async () => {
+  const controller = {
+    async list() {
+      return {
+        items: [
+          {
+            sessionId: "session-titled",
+            updatedAt: 2,
+            blank: true,
+            cwd: "/tmp",
+            projections: { values: { title: "手填标题" } },
+          },
+          {
+            sessionId: "session-untitled",
+            updatedAt: 1,
+            blank: true,
+            cwd: "/tmp",
+            projections: { values: {} },
+          },
+        ],
+      };
+    },
+  };
+  const bridge = new DshBridge(
+    { get: (key) => (key === "sessionController" ? controller : undefined) },
+    { allowedRoots: ["/tmp"], defaultDirectory: "/tmp" },
+    { debug() {}, info() {}, warn() {}, error() {} },
+  );
+  const views = await bridge.views();
+  // A title written on the new-session form is already a real topic name; only
+  // an untitled session needs the timestamp placeholder.
+  assert.equal(views.find((view) => view.sessionId === "session-titled").blank, false);
+  assert.equal(views.find((view) => view.sessionId === "session-untitled").blank, true);
+});
+
 test("completeText streams a one-shot LLM answer without creating a session", async () => {
   const calls = [];
   const llm = {
@@ -582,6 +617,206 @@ test("recover cancels pending questions and recalls their cards", async () => {
   const result = await pending;
   assert.deepEqual(result.answers, []);
   questions.close();
+});
+
+test("the live answer mode follows config changes without a restart", async () => {
+  const cards = [];
+  const texts = [];
+  const config = { answerMode: "post", maxAnswerChars: 4_000, streamThrottleMs: 100, stream: true };
+  const runs = new RunCards({
+    bridge: {
+      async viewOf(sessionId) {
+        return { sessionId, updatedAt: 0, running: false };
+      },
+    },
+    sender: {
+      async replyText(anchor, text) {
+        texts.push({ anchor, text });
+        return { ok: true, messageId: "om_ack" };
+      },
+      async replyCard(anchor, card) {
+        cards.push({ anchor, card });
+        return { ok: true, messageId: "om_card" };
+      },
+      async sendText(chatId, text) {
+        texts.push({ chatId, text });
+        return { ok: true, messageId: "om_ack" };
+      },
+      async sendCard(chatId, card) {
+        cards.push({ chatId, card });
+        return { ok: true, messageId: "om_card" };
+      },
+      async patchCard() {
+        return { ok: true };
+      },
+    },
+    state: {},
+    config,
+    log: { debug() {}, info() {}, warn() {} },
+  });
+
+  await runs.beginPrompt("session-post", {
+    anchorMessageId: "om_anchor_post",
+    chatId: "oc_chat",
+    threadId: "omt_post",
+  });
+  assert.equal(texts.length, 1);
+  assert.equal(cards.length, 0);
+
+  runs.config = { ...config, answerMode: "card" };
+  const cardRun = await runs.beginPrompt("session-card", {
+    anchorMessageId: "om_anchor_card",
+    chatId: "oc_chat",
+    threadId: "omt_card",
+  });
+  assert.equal(texts.length, 1);
+  assert.equal(cards.length, 1);
+  assert.equal(cardRun.messageId, "om_card");
+  runs.dispose();
+});
+
+test("a new-topic run card replies in-thread and records the returned thread", async () => {
+  const sent = [];
+  const runs = new RunCards({
+    bridge: {
+      async viewOf(sessionId) {
+        return { sessionId, updatedAt: 0, running: false };
+      },
+    },
+    sender: {
+      async replyCard(anchor, card, options = {}) {
+        sent.push({ anchor, card, options });
+        return { ok: true, messageId: "om_run", threadId: "omt_new" };
+      },
+      async patchCard() {
+        return { ok: true };
+      },
+    },
+    state: {},
+    config: { maxAnswerChars: 4_000, streamThrottleMs: 100 },
+    log: { debug() {}, info() {}, warn() {} },
+  });
+
+  const run = await runs.beginPrompt("session-open", {
+    anchorMessageId: "om_root_card",
+    chatId: "oc_chat",
+    openThread: true,
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].anchor, "om_root_card");
+  assert.deepEqual(sent[0].options, { replyInThread: true });
+  assert.equal(run.messageId, "om_run");
+  assert.equal(run.threadId, "omt_new");
+  runs.dispose();
+});
+
+test("the new-topic run card falls back to message metadata for its thread id", async () => {
+  const runs = new RunCards({
+    bridge: {
+      async viewOf(sessionId) {
+        return { sessionId, updatedAt: 0, running: false };
+      },
+    },
+    sender: {
+      async replyCard() {
+        return { ok: true, messageId: "om_run" };
+      },
+      async getMessageMeta(messageId) {
+        assert.equal(messageId, "om_run");
+        return { threadId: "omt_meta" };
+      },
+      async patchCard() {
+        return { ok: true };
+      },
+    },
+    state: {},
+    config: { maxAnswerChars: 4_000, streamThrottleMs: 100 },
+    log: { debug() {}, info() {}, warn() {} },
+  });
+
+  const run = await runs.beginPrompt("session-meta", {
+    anchorMessageId: "om_root_card",
+    chatId: "oc_chat",
+    openThread: true,
+  });
+  assert.equal(run.threadId, "omt_meta");
+  runs.dispose();
+});
+
+test("post mode opens the topic with its ack message", async () => {
+  const texts = [];
+  const runs = new RunCards({
+    bridge: {
+      async viewOf(sessionId) {
+        return { sessionId, updatedAt: 0, running: false };
+      },
+    },
+    sender: {
+      async replyText(anchor, text, options = {}) {
+        texts.push({ anchor, text, options });
+        return { ok: true, messageId: "om_ack", threadId: "omt_post" };
+      },
+      async patchCard() {
+        return { ok: true };
+      },
+    },
+    state: {},
+    config: { answerMode: "post", maxAnswerChars: 4_000, streamThrottleMs: 100 },
+    log: { debug() {}, info() {}, warn() {} },
+  });
+
+  const run = await runs.beginPrompt("session-post-open", {
+    anchorMessageId: "om_root_card",
+    chatId: "oc_chat",
+    openThread: true,
+  });
+  assert.equal(texts.length, 1);
+  assert.deepEqual(texts[0].options, { replyInThread: true });
+  assert.equal(run.threadId, "omt_post");
+  runs.dispose();
+});
+
+test("post mode answers reply inside the topic opened by its ack", async () => {
+  const posts = [];
+  const runs = new RunCards({
+    bridge: {
+      async viewOf(sessionId) {
+        return { sessionId, updatedAt: 0, running: false };
+      },
+    },
+    sender: {
+      async replyText() {
+        return { ok: true, messageId: "om_ack", threadId: "omt_post" };
+      },
+      async replyPost(anchor, post, options = {}) {
+        posts.push({ anchor, post, options });
+        return { ok: true, messageId: "om_answer" };
+      },
+      async recallMessage() {
+        return { ok: true };
+      },
+      async patchCard() {
+        return { ok: true };
+      },
+    },
+    state: {},
+    config: { answerMode: "post", maxAnswerChars: 4_000, streamThrottleMs: 100 },
+    log: { debug() {}, info() {}, warn() {} },
+  });
+
+  const run = await runs.beginPrompt("session-post-answer", {
+    anchorMessageId: "om_root_card",
+    chatId: "oc_chat",
+    openThread: true,
+  });
+  run.status = "done";
+  run.text = "答案";
+  await runs.sendAnswer(run);
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].anchor, "om_root_card");
+  assert.deepEqual(posts[0].options, { replyInThread: true });
+  runs.dispose();
 });
 
 test("run cards rotate to a fresh card after a question is answered", async () => {

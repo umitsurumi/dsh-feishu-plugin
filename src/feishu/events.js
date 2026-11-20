@@ -5,6 +5,14 @@ export function stripMentions(text) {
   return str(text).replace(/@_user_\d+\s*/g, "").trim();
 }
 
+/** True when a message mentions the bot's own open_id. */
+export function isBotMention(message, botOpenId) {
+  const bot = str(botOpenId);
+  if (!bot) return false;
+  const mentions = Array.isArray(message?.mentions) ? message.mentions : [];
+  return mentions.some((mention) => str(mention?.id?.open_id) === bot);
+}
+
 function json(raw) {
   if (isRecord(raw)) return raw;
   if (typeof raw !== "string") return undefined;
